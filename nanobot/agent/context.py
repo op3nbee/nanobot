@@ -3,6 +3,8 @@
 import base64
 import mimetypes
 import platform
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,12 +27,13 @@ class ContextBuilder:
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
     
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    def build_system_prompt(self, skill_names: list[str] | None = None, delegation_mode: bool = False) -> str:
         """
         Build the system prompt from bootstrap files, memory, and skills.
         
         Args:
             skill_names: Optional list of skills to include.
+            delegation_mode: If true, add delegation-mode instructions to the identity.
         
         Returns:
             Complete system prompt.
@@ -38,7 +41,7 @@ class ContextBuilder:
         parts = []
         
         # Core identity
-        parts.append(self._get_identity())
+        parts.append(self._get_identity(delegation_mode=delegation_mode))
         
         # Bootstrap files
         bootstrap = self._load_bootstrap_files()
@@ -70,22 +73,15 @@ Skills with available="false" need dependencies installed first - you can try in
         
         return "\n\n---\n\n".join(parts)
     
-    def _get_identity(self) -> str:
+    def _get_identity(self, delegation_mode: bool = False) -> str:
         """Get the core identity section."""
-        from datetime import datetime
-        import time as _time
-        now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
-        tz = _time.strftime("%Z") or "UTC"
         workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
         
-        return f"""# nanobot 🐈
+        base_identity = f"""# nanobot 🐈
 
 You are nanobot, a helpful AI assistant. 
-
-## Current Time
-{now} ({tz})
 
 ## Runtime
 {runtime}
@@ -96,14 +92,75 @@ Your workspace is at: {workspace_path}
 - History log: {workspace_path}/memory/HISTORY.md (grep-searchable)
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
-IMPORTANT: When responding to direct questions or conversations, reply directly with your text response.
-Only use the 'message' tool when you need to send a message to a specific chat channel (like WhatsApp).
-For normal conversation, just respond with text - do not call the message tool.
+Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel.
 
-Always be helpful, accurate, and concise. Before calling tools, briefly tell the user what you're about to do (one short sentence in the user's language).
-If you need to use tools, call them directly — never send a preliminary message like "Let me check" without actually calling a tool.
-When remembering something important, write to {workspace_path}/memory/MEMORY.md
-To recall past events, grep {workspace_path}/memory/HISTORY.md"""
+## Tool Call Guidelines
+- Before calling tools, you may briefly state your intent (e.g. "Let me check that"), but NEVER predict or describe the expected result before receiving it.
+- Before modifying a file, read it first to confirm its current content.
+- Do not assume a file or directory exists — use list_dir or read_file to verify.
+- After writing or editing a file, re-read it if accuracy matters.
+- If a tool call fails, analyze the error before retrying with a different approach.
+
+## Memory
+- Remember important facts: write to {workspace_path}/memory/MEMORY.md
+- Recall past events: grep {workspace_path}/memory/HISTORY.md
+
+## Subagent Spawning Rules
+- NEVER spawn multiple subagents for the same task in a single conversation
+- Before spawning, check if you already spawned a similar task recently (visible in your context)
+- If a subagent for the same task is already running, do NOT spawn another one
+- Wait for subagent completion before spawning related follow-up tasks"""
+
+        if delegation_mode:
+            base_identity += """
+
+## ⚡ Delegation Mode
+
+You are operating in **delegation mode**. Your role is to orchestrate and delegate, not execute.
+
+### Your Tools (Manager)
+- `spawn` — Delegate multistep tasks to a worker subagent
+- `message` — Send messages to external channels
+- `read_file` — Read files for context (you can still read)
+- `list_dir` — Explore directory structure
+
+### What You MUST Delegate
+Any task requiring these tools must be delegated via `spawn`:
+- `exec` (shell commands)
+- `web_search` / `web_fetch` (research)
+- `write_file` / `edit_file` (file modifications)
+
+### Workflow
+1. **Classify**: Is this a simple question or a task requiring action?
+2. **Simple question** → Answer directly (you can read files for context)
+3. **Multistep task** → Use `spawn` to delegate to a worker subagent
+4. **Review** → The worker's output will be QA-reviewed automatically
+
+### Example
+- User: "What's in the config file?" → You: `read_file` → Answer directly
+- User: "Write a script to scrape data and save it" → You: `spawn` → "I've delegated this to a worker..."
+- User: "Research the latest React version" → You: `spawn` → "I've started a research task..."
+
+**Stay lightweight. Delegate the heavy lifting.**"""
+
+        return base_identity
+
+    @staticmethod
+    def _inject_runtime_context(
+        user_content: str | list[dict[str, Any]],
+        channel: str | None,
+        chat_id: str | None,
+    ) -> str | list[dict[str, Any]]:
+        """Append dynamic runtime context to the tail of the user message."""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+        tz = time.strftime("%Z") or "UTC"
+        lines = [f"Current Time: {now} ({tz})"]
+        if channel and chat_id:
+            lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
+        block = "[Runtime Context]\n" + "\n".join(lines)
+        if isinstance(user_content, str):
+            return f"{user_content}\n\n{block}"
+        return [*user_content, {"type": "text", "text": block}]
     
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
@@ -125,6 +182,7 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
+        delegation_mode: bool = False,
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
@@ -136,6 +194,7 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
             media: Optional list of local file paths for images/media.
             channel: Current channel (telegram, feishu, etc.).
             chat_id: Current chat/user ID.
+            delegation_mode: If true, add delegation-mode instructions.
 
         Returns:
             List of messages including system prompt.
@@ -143,9 +202,7 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
         messages = []
 
         # System prompt
-        system_prompt = self.build_system_prompt(skill_names)
-        if channel and chat_id:
-            system_prompt += f"\n\n## Current Session\nChannel: {channel}\nChat ID: {chat_id}"
+        system_prompt = self.build_system_prompt(skill_names, delegation_mode=delegation_mode)
         messages.append({"role": "system", "content": system_prompt})
 
         # History
@@ -153,6 +210,7 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
 
         # Current message (with optional image attachments)
         user_content = self._build_user_content(current_message, media)
+        user_content = self._inject_runtime_context(user_content, channel, chat_id)
         messages.append({"role": "user", "content": user_content})
 
         return messages

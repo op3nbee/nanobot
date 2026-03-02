@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from loguru import logger
 from telegram import BotCommand, Update, ReplyParameters
@@ -13,6 +14,10 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import TelegramConfig
+
+# Suppress python-telegram-bot's shutdown warnings about get_updates cleanup
+# These are expected when network is unavailable during shutdown
+logging.getLogger("telegram.ext._updater").setLevel(logging.CRITICAL)
 
 
 def _markdown_to_telegram_html(text: str) -> str:
@@ -135,9 +140,11 @@ class TelegramChannel(BaseChannel):
         
         self._running = True
         
-        # Build the application with larger connection pool to avoid pool-timeout on long runs
+        # Build the application with shorter timeouts for cleaner shutdown
+        # Use shorter timeouts for get_updates to avoid long waits during shutdown
+        updates_req = HTTPXRequest(connection_pool_size=16, pool_timeout=5.0, connect_timeout=10.0, read_timeout=10.0)
         req = HTTPXRequest(connection_pool_size=16, pool_timeout=5.0, connect_timeout=30.0, read_timeout=30.0)
-        builder = Application.builder().token(self.config.token).request(req).get_updates_request(req)
+        builder = Application.builder().token(self.config.token).request(req).get_updates_request(updates_req)
         if self.config.proxy:
             builder = builder.proxy(self.config.proxy).get_updates_proxy(self.config.proxy)
         self._app = builder.build()
@@ -193,9 +200,18 @@ class TelegramChannel(BaseChannel):
         
         if self._app:
             logger.info("Stopping Telegram bot...")
-            await self._app.updater.stop()
-            await self._app.stop()
-            await self._app.shutdown()
+            try:
+                await self._app.updater.stop()
+            except Exception as e:
+                logger.debug("Error stopping updater (expected during shutdown): {}", e)
+            try:
+                await self._app.stop()
+            except Exception as e:
+                logger.debug("Error stopping app (expected during shutdown): {}", e)
+            try:
+                await self._app.shutdown()
+            except Exception as e:
+                logger.debug("Error shutting down app (expected during shutdown): {}", e)
             self._app = None
     
     @staticmethod

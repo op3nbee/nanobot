@@ -1,7 +1,9 @@
 """Subagent manager for background task execution."""
 
 import asyncio
+import hashlib
 import json
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -32,6 +34,7 @@ class SubagentManager:
         workspace: Path,
         bus: MessageBus,
         model: str | None = None,
+        manager_model: str | None = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
         brave_api_key: str | None = None,
@@ -43,12 +46,16 @@ class SubagentManager:
         self.workspace = workspace
         self.bus = bus
         self.model = model or provider.get_default_model()
+        self.manager_model = manager_model or self.model  # Tier-1 model used for QA review
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
+        # Spawn deduplication: track recent spawn hashes to prevent duplicates
+        self._spawn_history: dict[str, float] = {}  # hash -> timestamp
+        self._spawn_dedupe_window = 60.0  # seconds to remember spawns
     
     async def spawn(
         self,
@@ -69,6 +76,23 @@ class SubagentManager:
         Returns:
             Status message indicating the subagent was started.
         """
+        # Spawn deduplication: check if we recently spawned the same task
+        spawn_hash = hashlib.md5(f"{label or ''}:{task}".encode()).hexdigest()[:16]
+        now = time.time()
+        
+        # Clean old entries
+        self._spawn_history = {
+            h: t for h, t in self._spawn_history.items()
+            if now - t < self._spawn_dedupe_window
+        }
+        
+        if spawn_hash in self._spawn_history:
+            logger.warning("Duplicate spawn blocked: [{}] (hash={})", label or task[:30], spawn_hash)
+            return f"Subagent [{label or task[:30]}] is already running. Skipping duplicate spawn."
+        
+        # Record this spawn
+        self._spawn_history[spawn_hash] = now
+        
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         
@@ -175,6 +199,10 @@ class SubagentManager:
             if final_result is None:
                 final_result = "Task completed but no final response was generated."
             
+            # QA Review: manager model checks subagent output (only if using a different model)
+            if self.manager_model != self.model:
+                final_result = await self._qa_review(task_id, task, final_result)
+
             logger.info("Subagent [{}] completed successfully", task_id)
             await self._announce_result(task_id, label, task, final_result, origin, "ok")
             
@@ -195,14 +223,11 @@ class SubagentManager:
         """Announce the subagent result to the main agent via the message bus."""
         status_text = "completed successfully" if status == "ok" else "failed"
         
-        announce_content = f"""[Subagent '{label}' {status_text}]
-
-Task: {task}
-
-Result:
-{result}
-
-Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not mention technical details like "subagent" or task IDs."""
+        # Log the full result for debugging
+        logger.info("Subagent [{}] result: {}", task_id, result[:500] if result else "None")
+        
+        # Send notification with full result
+        announce_content = f"Background task '{label}' {status_text}.\n\n**Result:**\n{result}"
         
         # Inject as system message to trigger main agent
         msg = InboundMessage(
@@ -255,3 +280,44 @@ When you have completed the task, provide a clear summary of your findings or ac
     def get_running_count(self) -> int:
         """Return the number of currently running subagents."""
         return len(self._running_tasks)
+
+    async def _qa_review(self, task_id: str, task: str, result: str) -> str:
+        """Use the manager (Tier-1) model to review the subagent output."""
+        logger.info("Subagent [{}] running QA review with manager model ({})", task_id, self.manager_model)
+        qa_prompt = f"""You are a quality-control reviewer. A worker agent was given the following task:
+
+TASK:
+{task}
+
+WORKER OUTPUT:
+{result}
+
+Review the output. If it is complete, accurate, and directly addresses the task, reply with:
+PASS: <brief one-sentence summary of what was accomplished>
+
+If the output is incomplete, incorrect, or off-task, reply with:
+ISSUE: <specific description of what is missing or wrong>
+
+Do NOT rewrite the output. Only evaluate it."""
+
+        try:
+            qa_response = await self.provider.chat(
+                messages=[
+                    {"role": "system", "content": "You are a precise QA reviewer for AI agent outputs."},
+                    {"role": "user", "content": qa_prompt},
+                ],
+                tools=[],
+                model=self.manager_model,
+                temperature=0.2,
+                max_tokens=512,
+            )
+            verdict = (qa_response.content or "").strip()
+            logger.info("Subagent [{}] QA verdict: {}", task_id, verdict[:120])
+
+            if verdict.upper().startswith("ISSUE:"):
+                return f"{result}\n\n---\n**QA Note (manager review):** {verdict}"
+            else:
+                return result
+        except Exception as e:
+            logger.warning("Subagent [{}] QA review failed ({}), using original result", task_id, e)
+            return result
